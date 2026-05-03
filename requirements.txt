@@ -1,0 +1,11 @@
+pyautogui
+PyQt6
+mss
+Pillow
+openai
+pydantic
+numpy
+python-dotenv
+PyYAML
+pytest
+opencv-python-headless

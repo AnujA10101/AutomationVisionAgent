@@ -1,0 +1,14 @@
+.env
+__pycache__/
+.pytest_cache/
+.DS_Store
+.venv/
+venv/
+env/
+ENV/
+*.log
+logs/*.log
+screenshots/*.png
+screenshots/*.jpg
+screenshots/*.jpeg
+screenshots/*.webp

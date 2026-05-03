@@ -1,0 +1,49 @@
+app:
+  name: AutomationVisionAgent
+  debug: true
+
+screen:
+  monitor_index: 1
+  screenshot_width: 1280
+
+agent:
+  max_steps: 8
+  max_actions_per_step: 3
+  action_delay_seconds: 0.35
+  step_wait_seconds: 1.0
+  retry_on_invalid_coordinates: true
+  max_coordinate_retries: 1
+
+llm:
+  model: gpt-4.1-mini
+  max_actions: 3
+  temperature: 0
+
+vision:
+  annotated_screenshots: true
+  coordinate_grid_spacing: 100
+  draw_cursor_marker: true
+  draw_grid_labels: true
+  hide_overlay_during_capture: true
+
+targeting:
+  use_bounding_boxes: true
+  min_target_confidence: 0.55
+  click_box_center: true
+  enable_template_matching: true
+  template_match_threshold: 0.78
+  max_targeting_retries: 1
+  fallback_to_action_planner: true
+  # If the next targeting click center is within this distance (capture px) of the last
+  # targeting click, skip repeat clicks and use the action planner instead. Set 0 to disable.
+  duplicate_click_min_distance_px: 28
+
+actions:
+  allow_hotkeys: false
+  allow_press: false
+
+safety:
+  pyautogui_failsafe: true
+  emergency_stop_key: escape
+  # MVP test click must run without a confirmation dialog (not implemented yet).
+  require_confirmation_for_risky_actions: false
