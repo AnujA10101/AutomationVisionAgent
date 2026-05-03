@@ -3,12 +3,10 @@
 from __future__ import annotations
 
 import logging
-import math
 import time
 from collections.abc import Callable
 from typing import TYPE_CHECKING, Literal
 
-import pyautogui
 from PIL import Image
 
 from app.config import SETTINGS
@@ -18,14 +16,17 @@ from app.executor import ActionExecutor
 from app.llm import OpenAIClient
 from app.schema import AgentPlan
 from app.targeting import (
-    TargetBox,
-    center_of_box,
-    draw_target_box,
-    list_template_paths,
-    locate_template,
-    scale_target_box_to_capture,
+    LocatedTarget,
+    target_signature,
+    validate_target_bounds,
 )
-from app.vision import ScreenCapture, create_annotated_screenshot, save_debug_image
+from app.vision import (
+    ScreenCapture,
+    create_coordinate_map_screenshot,
+    draw_located_target,
+    save_debug_image,
+)
+from app.utils import project_root
 
 if TYPE_CHECKING:
     from app.overlay import OverlayWindow
@@ -33,15 +34,20 @@ if TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 
 
-def _cursor_on_resized(
-    cap_xy: tuple[int, int],
-    original_size: tuple[int, int],
-    resized_size: tuple[int, int],
-) -> tuple[int, int]:
-    ox, oy = cap_xy
-    ow, oh = original_size
-    rw, rh = resized_size
-    return int(round(ox * rw / ow)), int(round(oy * rh / oh))
+def _is_repeated_target(recent_targets: list[str], current_signature: str, threshold: int = 2) -> bool:
+    """Return True if the same signature has been chosen repeatedly."""
+    if not recent_targets:
+        return False
+    recent = recent_targets[-threshold:]
+    return len(recent) == threshold and all(s == current_signature for s in recent)
+
+
+def _is_inconsistent_targeting(recent_targets: list[str]) -> bool:
+    """Detect oscillation across unrelated targets in recent selections."""
+    if len(recent_targets) < 4:
+        return False
+    a, b, c, d = recent_targets[-4:]
+    return a == c and b == d and a != b
 
 
 class AutomationAgent:
@@ -60,13 +66,15 @@ class AutomationAgent:
         controller: AgentController,
         capture: ScreenCapture | None = None,
         overlay: OverlayWindow | None = None,
+        confirm_target: Callable[[str], bool] | None = None,
     ) -> None:
         self._llm = llm
         self._executor = executor
         self._controller = controller
         self._capture = capture or ScreenCapture()
         self._overlay = overlay
-        self._last_targeting_click_center: tuple[int, int] | None = None
+        self._confirm_target = confirm_target
+        self._recent_target_signatures: list[str] = []
 
     def _set_overlay_hidden_for_capture(self, hide: bool) -> None:
         if (
@@ -98,162 +106,116 @@ class AutomationAgent:
         *,
         step: int,
         user_prompt: str,
-        image: Image.Image,
-        original_size: tuple[int, int],
         resized: Image.Image,
         resized_size: tuple[int, int],
         step_summaries: list[str],
         status: Callable[[str], None],
     ) -> Literal["click_done", "use_planner", "stop_run"]:
-        """Try template + LLM bounding box before the action planner."""
+        """Coordinate-map targeting path: locate -> validate -> click point."""
         if not SETTINGS.targeting.use_bounding_boxes:
             return "use_planner"
-
         if self._controller.should_stop():
             return "use_planner"
 
-        ow, oh = original_size
         rw, rh = resized_size
-        min_conf = float(SETTINGS.targeting.min_target_confidence)
-        max_retries = int(SETTINGS.targeting.max_targeting_retries)
+        cursor_pos = None
 
-        box_capture: TargetBox | None = None
+        coord_map = create_coordinate_map_screenshot(
+            resized,
+            grid_cols=int(SETTINGS.vision.grid_cols),
+            grid_rows=int(SETTINGS.vision.grid_rows),
+            fine_grid_spacing=int(SETTINGS.vision.fine_grid_spacing),
+            cursor_position=cursor_pos,
+        )
+        if SETTINGS.vision.save_coordinate_map_debug:
+            save_debug_image(coord_map, f"debug_coordinate_map_step_{step:03d}")
 
-        if SETTINGS.targeting.enable_template_matching:
-            status(f"Step {step}: Template matching…")
-            for tpl in list_template_paths():
-                if self._controller.should_stop():
-                    return "use_planner"
-                tb = locate_template(
-                    image,
-                    tpl,
-                    threshold=float(SETTINGS.targeting.template_match_threshold),
-                )
-                if tb is None:
-                    continue
-                if not tb.within_bounds(ow, oh):
-                    logger.warning("Template box outside capture bounds; skipping %s", tpl)
-                    continue
-                if tb.confidence < min_conf:
-                    continue
-                box_capture = tb
-                logger.info("Template hit: %s conf=%.3f", tpl.name, tb.confidence)
-                break
-
-        if box_capture is None:
-            ann_base = resized
-            cursor_pos = None
-            if SETTINGS.vision.annotated_screenshots:
-                cap_xy = pyautogui.position()
-                if SETTINGS.vision.draw_cursor_marker:
-                    cursor_pos = _cursor_on_resized((int(cap_xy[0]), int(cap_xy[1])), original_size, resized_size)
-                ann_base = create_annotated_screenshot(
-                    resized,
-                    cursor_position=cursor_pos,
-                    grid_spacing=int(SETTINGS.vision.coordinate_grid_spacing),
-                    draw_labels=SETTINGS.vision.draw_grid_labels,
-                )
-            else:
-                ann_base = resized.copy()
-
-            try:
-                ann_b64 = self._capture.image_to_base64(ann_base)
-            except ValueError as exc:
-                logger.warning("Annotated image encode failed: %s", exc)
-                return self._targeting_fail_no_fallback(status)
-
-            corrective: str | None = None
-            for attempt in range(max_retries + 1):
-                if self._controller.should_stop():
-                    return "use_planner"
-                status(
-                    f"Step {step}: Locating target (attempt {attempt + 1}/{max_retries + 1})…"
-                )
-                tb = self._llm.locate_target_box(
-                    user_task=user_prompt,
-                    screenshot_base64=ann_b64,
-                    screenshot_width=rw,
-                    screenshot_height=rh,
-                    previous_summaries=step_summaries[-5:],
-                    corrective=corrective,
-                )
-                if tb is None:
-                    corrective = (
-                        "The previous response was missing or invalid. "
-                        f"Return strict JSON with a tight box inside {rw}x{rh} or found=false."
-                    )
-                    if attempt >= max_retries:
-                        break
-                    continue
-
-                if not tb.within_bounds(rw, rh):
-                    logger.warning("LLM box outside resized bounds: %s", tb)
-                    corrective = (
-                        "The previous plan had coordinates outside the screenshot bounds. "
-                        f"Screenshot size is {rw} x {rh}. Return corrected JSON only."
-                    )
-                    if attempt >= max_retries:
-                        break
-                    continue
-
-                if tb.confidence < min_conf:
-                    logger.warning("LLM box below min confidence %.3f < %.3f", tb.confidence, min_conf)
-                    corrective = (
-                        f"Confidence was too low ({tb.confidence:.2f}). "
-                        "Return a higher-confidence box or found=false."
-                    )
-                    if attempt >= max_retries:
-                        break
-                    continue
-
-                scaled = scale_target_box_to_capture(
-                    tb,
-                    original_size=original_size,
-                    resized_size=resized_size,
-                )
-                if not scaled.within_bounds(ow, oh):
-                    logger.warning("Scaled box outside capture bounds")
-                    corrective = "Box scaled out of range; return a smaller valid box."
-                    if attempt >= max_retries:
-                        break
-                    continue
-
-                box_capture = scaled
-                break
-
-        if box_capture is None:
+        try:
+            ann_b64 = self._capture.image_to_base64(coord_map)
+        except ValueError as exc:
+            logger.warning("Coordinate map encode failed: %s", exc)
             return self._targeting_fail_no_fallback(status)
 
-        if self._controller.should_stop():
+        corrective: str | None = None
+        max_retries = int(SETTINGS.targeting.max_locator_retries)
+        chosen: LocatedTarget | None = None
+
+        for attempt in range(max_retries + 1):
+            if self._controller.should_stop():
+                return "use_planner"
+            status(f"Step {step}: Locating target on coordinate map ({attempt + 1}/{max_retries + 1})…")
+            target = self._llm.locate_target_with_coordinate_map(
+                user_task=user_prompt,
+                annotated_screenshot_base64=ann_b64,
+                screenshot_width=rw,
+                screenshot_height=rh,
+                step_index=step,
+                previous_summaries=step_summaries[-5:],
+                corrective=corrective,
+            )
+            if not target.found:
+                corrective = "No target found. If visible, return one target with grid_cell and click point."
+                if attempt >= max_retries:
+                    break
+                continue
+            if target.confidence < float(SETTINGS.targeting.min_target_confidence):
+                corrective = (
+                    f"Confidence too low ({target.confidence:.2f}); return a clearly visible target or found=false."
+                )
+                if attempt >= max_retries:
+                    break
+                continue
+            if SETTINGS.targeting.require_grid_cell and not target.grid_cell:
+                corrective = "grid_cell is required; return grid_cell and full target JSON."
+                if attempt >= max_retries:
+                    break
+                continue
+            if SETTINGS.targeting.require_box_inside_screenshot and not validate_target_bounds(target, rw, rh):
+                corrective = (
+                    f"Box/click must be inside screenshot {rw}x{rh}, and click must be inside the box."
+                )
+                if attempt >= max_retries:
+                    break
+                continue
+            if SETTINGS.targeting.require_click_point_inside_box and not validate_target_bounds(target, rw, rh):
+                corrective = "click_x/click_y must be inside [x1,x2] and [y1,y2]."
+                if attempt >= max_retries:
+                    break
+                continue
+            chosen = target
+            break
+
+        if chosen is None:
+            return self._targeting_fail_no_fallback(status)
+
+        sig = target_signature(chosen)
+        if _is_repeated_target(self._recent_target_signatures, sig):
+            status("Repeated target detected with no progress; stopping safely.")
+            logger.warning("Repeated target signature detected: %s", sig)
+            return "stop_run"
+        if _is_inconsistent_targeting(self._recent_target_signatures + [sig]):
+            logger.warning("Inconsistent target oscillation detected; requesting re-evaluation.")
             return "use_planner"
 
-        cx, cy = center_of_box(box_capture)
-        min_dist = int(SETTINGS.targeting.duplicate_click_min_distance_px)
-        if min_dist > 0 and self._last_targeting_click_center is not None:
-            lx, ly = self._last_targeting_click_center
-            dist = math.hypot(float(cx - lx), float(cy - ly))
-            if dist < float(min_dist):
-                logger.warning(
-                    "Skipping duplicate targeting click: center (%s,%s) is %.1fpx from last (%s,%s); "
-                    "falling back to action planner.",
-                    cx,
-                    cy,
-                    dist,
-                    lx,
-                    ly,
-                )
-                status("Avoiding repeat click on same spot — using action planner…")
-                return "use_planner"
+        if SETTINGS.targeting.require_user_confirmation_before_click:
+            status(f"Review target: {chosen.target_label} ({chosen.confidence:.2f})")
+            if self._confirm_target is None:
+                status("Target review mode enabled but no confirmation hook; stopping safely.")
+                return "stop_run"
+            if not self._confirm_target(f"{chosen.target_label} ({chosen.confidence:.2f})"):
+                status("Target click cancelled by user.")
+                return "stop_run"
 
+        assert chosen.click_x is not None and chosen.click_y is not None
         status("Executing targeted click…")
-        self._executor.click(cx, cy)
-        self._last_targeting_click_center = (cx, cy)
+        self._executor.click(chosen.click_x, chosen.click_y)
+        self._recent_target_signatures.append(sig)
+        self._recent_target_signatures = self._recent_target_signatures[-8:]
 
-        dbg = draw_target_box(image.copy(), box_capture)
-        save_debug_image(dbg, f"debug_target_step_{step:03d}")
-
+        output_path = project_root() / "screenshots" / f"debug_selected_target_step_{step:03d}.png"
+        draw_located_target(coord_map, chosen, output_path)
         step_summaries.append(
-            f"{box_capture.label} ({box_capture.source}, conf={box_capture.confidence:.2f})"
+            f"{chosen.target_label or 'target'} @ {chosen.grid_cell or '?'} (conf={chosen.confidence:.2f})"
         )
         return "click_done"
 
@@ -280,7 +242,7 @@ class AutomationAgent:
                 on_status(msg)
 
         self._controller.reset()
-        self._last_targeting_click_center = None
+        self._recent_target_signatures = []
         logger.info("User task: %r", user_prompt)
 
         status("Running...")
@@ -316,8 +278,6 @@ class AutomationAgent:
             vt = self._visual_targeting_attempt(
                 step=step,
                 user_prompt=user_prompt,
-                image=image,
-                original_size=original_size,
                 resized=resized,
                 resized_size=resized_size,
                 step_summaries=step_summaries,

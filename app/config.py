@@ -46,6 +46,11 @@ class SafetySection(BaseModel):
 
 
 class VisionSection(BaseModel):
+    coordinate_map_enabled: bool = True
+    grid_cols: int = 12
+    grid_rows: int = 8
+    fine_grid_spacing: int = 50
+    save_coordinate_map_debug: bool = True
     annotated_screenshots: bool = True
     coordinate_grid_spacing: int = 100
     draw_cursor_marker: bool = True
@@ -55,13 +60,18 @@ class VisionSection(BaseModel):
 
 class TargetingSection(BaseModel):
     use_bounding_boxes: bool = True
-    min_target_confidence: float = 0.55
+    require_grid_cell: bool = True
+    require_click_point_inside_box: bool = True
+    require_box_inside_screenshot: bool = True
+    min_target_confidence: float = 0.70
+    max_locator_retries: int = 2
     click_box_center: bool = True
     enable_template_matching: bool = True
     template_match_threshold: float = 0.78
     max_targeting_retries: int = 1
     fallback_to_action_planner: bool = True
     duplicate_click_min_distance_px: int = 28
+    require_user_confirmation_before_click: bool = False
 
 
 class ActionsSection(BaseModel):

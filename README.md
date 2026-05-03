@@ -6,15 +6,23 @@ Local desktop app for an AI-assisted **screen-control agent**: capture the displ
 
 **Step 4 + Step 6 (implemented):** **Cursor-only** browser/system control: no hotkeys in settings by default (`actions.allow_hotkeys: false`, `actions.allow_press: false`). The **action planner** and **target locator** prompts forbid Command/Ctrl shortcuts; execution rejects `hotkey` / `press` when disabled.
 
-**Visual grounding (Step 6):** Each step can use, in order:
+**Visual grounding (Step 6):** Every step creates a **coordinate-map screenshot** and runs a strict locator:
 
-1. **Template matching** — optional `opencv` match on the **full capture** for PNGs in `assets/templates/` (e.g. a crop of the new-tab `+` icon). No file → skipped safely.
-2. **LLM bounding box** — an **annotated** screenshot (grid + axis labels, optional cursor marker) is sent to a dedicated **target locator** model call (`response_format: json_object`). The model returns a box in **resized** image space; the app validates confidence, maps the box to **capture** space, and **clicks the center** (no raw point guess for that path).
-3. **Action planner fallback** — if `targeting.fallback_to_action_planner` is `true` and targeting fails, the existing JSON **action plan** runs (move/click/type/scroll/wait only in instructions).
+1. Build map overlay with coarse cells (A1, B1…), fine pixel grid, axis labels, and dimensions text.
+2. Send this map image to the locator model and require:
+   - `grid_cell`
+   - bounding box (`x1,y1,x2,y2`)
+   - explicit click point (`click_x, click_y`) inside the box
+   - confidence
+3. Validate target shape + bounds (no clamping), reject low-confidence targets, and retry with corrective feedback.
+4. Click only the validated click point.
 
-**Debug images** after a successful target decision: `screenshots/debug_target_step_001.png`, `..._002.png`, … (drawn box + label).
+**Debug images**
 
-**Why boxes instead of a single (x,y):** A tight **rectangle** around a control is easier to hit than one mis-guessed pixel; the app uses the **box center** for the click when `targeting.click_box_center` is `true`.
+- Coordinate map snapshot per step: `screenshots/debug_coordinate_map_step_001.png`
+- Selected target overlay per step: `screenshots/debug_selected_target_step_001.png`
+
+**Why this is stronger than raw x/y guessing:** the model references labeled cells and pixel axes, then must return both box and in-box click point, which is validated before execution.
 
 **Overlay during capture:** If `vision.hide_overlay_during_capture` is `true`, the transparent overlay is **hidden** for one frame so it is not part of the screenshot.
 
@@ -60,9 +68,9 @@ Do **not** commit `.env`. The shell will **not** show the key with `echo $OPENAI
 - `screen` — monitor index, max width for downscaled “LLM” image  
 - `llm` — model, `max_actions`, `temperature`  
 - `agent` — `max_steps`, delays, coordinate retries  
-- `vision` — annotated screenshots, grid spacing, hide overlay while capturing  
-- `targeting` — bounding-box path, `min_target_confidence`, template threshold, retries, `fallback_to_action_planner`  
-- `actions` — `allow_hotkeys`, `allow_press` (default false = cursor + type/scroll only)  
+- `vision` — coordinate-map overlay (`grid_cols`, `grid_rows`, fine grid spacing), debug map saves, hide overlay while capturing  
+- `targeting` — required grid cell/click-point checks, confidence threshold, locator retries, consistency checks, optional review mode  
+- `actions` — `allow_hotkeys=false`, `allow_press=false` by default (cursor + type/scroll only)  
 - `safety` — failsafe, optional risky-action skipping  
 
 ## Run the app
@@ -77,7 +85,7 @@ Example (cursor-oriented; no hotkeys in default config):
 Open a new tab in the browser
 ```
 
-You should see: capture (overlay hidden if configured) → template pass (if you add a template) or **annotated** image to the **locator** → validated **click** at box center → debug PNG under `screenshots/`, or **planner** fallback on failure if enabled.
+You should see: capture (overlay hidden if configured) → **coordinate-map screenshot** → locator JSON with `grid_cell + box + click point` → validation → cursor move/click → debug PNGs under `screenshots/`.
 
 ## Templates under `assets/templates/`
 
@@ -86,11 +94,20 @@ You should see: capture (overlay hidden if configured) → template pass (if you
 - If **no** template is present, template matching is skipped.  
 - Browser chrome **varies** by browser, theme, and zoom — you may need different crops per machine.
 
+## Target Review Mode
+
+`targeting.require_user_confirmation_before_click` is available (default `false`).
+
+- When `true`, the app prepares the selected target and requires a confirmation hook before clicking.
+- If review mode is on but no confirmation hook is wired, the run stops safely.
+
 ## Limitations
 
-- **Tiny icons** and **Retina / scaling** still make matching hard.  
-- **LLM** can still pick the **wrong** box; always use **Stop** if it drifts.  
-- **Template** quality and **threshold** (`targeting.template_match_threshold`) must be tuned per environment.  
+- **LLM** can still misread very small icons.  
+- Grid overlays can obscure tiny UI details in dense chrome.  
+- Very small controls may still need zoom/crop workflows.  
+- Confidence can still be overestimated by the model.  
+- Browser chrome varies by theme/window size/platform.  
 - **Multi-monitor** / **HiDPI** alignment between mss and pyautogui is not perfect.  
 - **No** screenshot-diff “wait until UI changed” yet (only `step_wait_seconds`).
 
@@ -105,10 +122,10 @@ Tests do **not** move the mouse, call OpenAI, or open the full GUI (except what 
 ## Project layout (main pieces)
 
 - `app/main.py` — Qt, worker, overlay passed into the agent for capture hide  
-- `app/agent.py` — observe–act loop, **targeting** then **planner** fallback  
-- `app/llm.py` — target locator + action planner, `filter_disallowed_actions`  
-- `app/targeting.py` — `TargetBox`, template match, `draw_target_box`  
-- `app/vision.py` — capture, **annotated** screenshot, `save_debug_image`  
+- `app/agent.py` — observe–act loop, coordinate-map locator retries, consistency protection  
+- `app/llm.py` — coordinate-map target locator + action planner, disallowed-action filtering  
+- `app/targeting.py` — strict `LocatedTarget` model + bounds/signature helpers  
+- `app/vision.py` — coordinate-map rendering + selected-target debug drawing  
 - `app/executor.py` — pyautogui; blocks `hotkey`/`press` when config says so  
 - `app/overlay.py` — `visibility_for_capture` to hide during mss grab  
 

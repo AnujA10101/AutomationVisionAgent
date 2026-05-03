@@ -9,11 +9,11 @@ from typing import Any
 
 from openai import OpenAI
 from openai import APIError, APIConnectionError, APITimeoutError, AuthenticationError, RateLimitError
-from pydantic import BaseModel, ValidationError
+from pydantic import ValidationError
 
 from app.config import OPENAI_API_KEY, SETTINGS
 from app.schema import Action, AgentPlan
-from app.targeting import TargetBox
+from app.targeting import LocatedTarget
 
 logger = logging.getLogger(__name__)
 
@@ -51,7 +51,7 @@ Rules:
 Cursor-only control:
 
 * Do NOT use hotkey or keyboard shortcuts (no Command/Control/Alt combinations).
-* Do NOT use press except where explicitly needed for text entry after focusing a field (prefer avoiding press entirely).
+* Do NOT use press actions. Use only move, click, type, scroll, wait, drag, or resize.
 * Prefer **move** and **click** using coordinates; targets should align with prior bounding-box grounding when applicable.
 * **drag** — press at (x, y), hold `button` (default left), move to (end_x, end_y), release. Use for sliders, selection marquees, dragging files, or **resize** (use type **resize** for the same fields when adjusting window/edge/corner size so the model can distinguish intent). Optional **duration_seconds** is the time to perform the drag motion (not used for **wait**).
 * **resize** — same fields as **drag**; pick the handle (edge or corner) as the start and drag to the desired end.
@@ -68,42 +68,61 @@ Safety:
 * Do not answer or complete graded exams, quizzes, or assessments.
 """
 
-TARGET_LOCATOR_SYSTEM_PROMPT = """You are a visual UI target locator. You receive an annotated screenshot (grid labels) and a user task. Identify the single best visible element that should be clicked next.
+TARGET_LOCATOR_SYSTEM_PROMPT = """You are a visual UI target locator for a cursor-only desktop automation app.
+
+You receive an annotated screenshot with:
+* labeled grid cells like A1, B1, C1
+* pixel x/y labels
+* screenshot dimensions
+
+Your job is to locate the next visible target that the cursor should click.
 
 Return ONLY valid JSON:
 
 {
   "found": true,
-  "label": "short target name",
+  "target_label": "short name of target",
+  "grid_cell": "cell label like B3",
   "x1": int,
   "y1": int,
   "x2": int,
   "y2": int,
+  "click_x": int,
+  "click_y": int,
   "confidence": float,
-  "source": "llm_visual",
-  "reason": "short reason"
+  "source": "llm_coordinate_map",
+  "reason": "brief reason"
 }
 
-Or when nothing suitable is visible:
+If target is not visible, return:
 
 {
   "found": false,
-  "reason": "why no target"
+  "confidence": 0,
+  "source": "llm_coordinate_map",
+  "reason": "target not visible"
 }
 
 Rules:
 
-* Coordinates must be in the annotated screenshot coordinate system (pixels).
-* Use grid labels to estimate positions.
-* Return a tight bounding box around the clickable region (not just a point).
-* **Multi-step tasks:** Read “Previous step summaries”. If the **next** step should be typing, scrolling, or focusing a **different** control (address bar, search field), locate **that** element — not the same control again (e.g. do not keep picking “new tab” once a tab is open if the user still needs to navigate or type).
-* If the correct **next** click target is unclear or the UI already reflects the last action, return **found=false** so another subsystem can plan typing/scrolling.
-* Prefer the visible clickable control that advances the **remaining** user task.
-* If the target is not visible or confidence would be low, set found=false.
-* Do not guess wildly — prefer found=false over a junk box.
-* Do not suggest hotkeys or keyboard shortcuts. Locating targets for mouse clicking only.
+* Coordinates must be in the annotated screenshot coordinate system.
+* Use the visible grid and pixel labels to estimate coordinates.
+* Return a bounding box around the clickable target.
+* Return a click point inside the bounding box.
+* The click point should usually be the center of the clickable target.
+* Do not invent targets that are not visible.
+* Do not return high confidence unless the target is clearly visible.
+* If unsure between multiple targets, choose the safest obvious target or return found=false.
+* Do not use hotkeys.
+* Do not use keyboard shortcuts.
+* Do not suggest keyboard commands.
+* The app can only move the cursor, click, type into focused fields, scroll, and wait.
 
-Confidence must be between 0 and 1 when found=true.
+For browser navigation:
+* To open a new tab, locate the visible + new tab button.
+* To type a URL, locate the visible address/search bar first.
+* To click a page result or visible link, locate the visible link text or button.
+* If the user asks to type text, the target should be the text field where typing should happen.
 """
 
 
@@ -133,24 +152,12 @@ def parse_model_response_to_plan(content: str) -> AgentPlan:
     return parse_plan_json(cleaned)
 
 
-class LocateTargetResponse(BaseModel):
-    found: bool
-    label: str | None = None
-    x1: int | None = None
-    y1: int | None = None
-    x2: int | None = None
-    y2: int | None = None
-    confidence: float | None = None
-    source: str = "llm_visual"
-    reason: str | None = None
-
-
-def _parse_locate_response(raw: str) -> LocateTargetResponse:
+def _parse_locate_response(raw: str) -> LocatedTarget:
     cleaned = _strip_code_fences(raw.strip())
     data: Any = json.loads(cleaned)
     if not isinstance(data, dict):
         raise ValueError("Locator JSON must be an object")
-    return LocateTargetResponse.model_validate(data)
+    return LocatedTarget.model_validate(data)
 
 
 def _build_user_message_text(
@@ -251,27 +258,26 @@ class OpenAIClient:
         else:
             self._client = None
 
-    def locate_target_box(
+    def locate_target_with_coordinate_map(
         self,
         *,
         user_task: str,
-        screenshot_base64: str,
+        annotated_screenshot_base64: str,
         screenshot_width: int,
         screenshot_height: int,
+        step_index: int,
         previous_summaries: list[str] | None = None,
         corrective: str | None = None,
-    ) -> TargetBox | None:
+    ) -> LocatedTarget:
         """
-        Ask the LLM for a single bounding box in annotated screenshot coordinates.
-
-        Returns None if the model reports no suitable target or parsing/validation fails.
+        Ask the LLM to locate next click target using coordinate-map annotated screenshot.
         """
         if not self._client:
             raise RuntimeError(
                 "OPENAI_API_KEY is not set. Copy `.env.example` to `.env` and add your key (see README)."
             )
-        if not screenshot_base64.strip():
-            raise ValueError("screenshot_base64 is required.")
+        if not annotated_screenshot_base64.strip():
+            raise ValueError("annotated_screenshot_base64 is required.")
 
         model = SETTINGS.llm.model
         temperature = float(SETTINGS.llm.temperature)
@@ -280,12 +286,12 @@ class OpenAIClient:
             user_task=user_task,
             screenshot_width=screenshot_width,
             screenshot_height=screenshot_height,
-            step_summaries=previous_summaries,
+            step_summaries=(previous_summaries or []) + [f"Step index: {step_index}"],
             corrective_message=corrective,
         )
         user_content: list[dict[str, Any]] = [
             {"type": "text", "text": text},
-            {"type": "image_url", "image_url": {"url": f"data:image/png;base64,{screenshot_base64}"}},
+            {"type": "image_url", "image_url": {"url": f"data:image/png;base64,{annotated_screenshot_base64}"}},
         ]
 
         logger.info("Calling OpenAI target locator model=%s", model)
@@ -323,40 +329,15 @@ class OpenAIClient:
             resp = _parse_locate_response(raw)
         except (json.JSONDecodeError, ValidationError) as exc:
             logger.warning("Locator JSON invalid: %s", exc)
-            return None
-
-        if not resp.found:
-            logger.info("Locator reported found=false: %s", resp.reason)
-            return None
-
-        if (
-            resp.x1 is None
-            or resp.y1 is None
-            or resp.x2 is None
-            or resp.y2 is None
-            or resp.label is None
-        ):
-            logger.warning("Locator missing box fields when found=true")
-            return None
-
-        conf = resp.confidence if resp.confidence is not None else 0.75
-
-        try:
-            box = TargetBox(
-                label=resp.label,
-                x1=int(resp.x1),
-                y1=int(resp.y1),
-                x2=int(resp.x2),
-                y2=int(resp.y2),
-                confidence=float(conf),
-                source=resp.source or "llm_visual",
-                reason=resp.reason,
+            return LocatedTarget(
+                found=False,
+                confidence=0.0,
+                source="llm_coordinate_map",
+                reason=f"invalid locator JSON: {exc}",
             )
-        except ValueError as exc:
-            logger.warning("TargetBox validation failed: %s", exc)
-            return None
-
-        return box
+        if not resp.found:
+            return resp.model_copy(update={"confidence": 0.0 if resp.confidence is None else resp.confidence})
+        return resp
 
     def get_action_plan(
         self,

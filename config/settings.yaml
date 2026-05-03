@@ -20,6 +20,11 @@ llm:
   temperature: 0
 
 vision:
+  coordinate_map_enabled: true
+  grid_cols: 12
+  grid_rows: 8
+  fine_grid_spacing: 50
+  save_coordinate_map_debug: true
   annotated_screenshots: true
   coordinate_grid_spacing: 100
   draw_cursor_marker: true
@@ -28,12 +33,17 @@ vision:
 
 targeting:
   use_bounding_boxes: true
-  min_target_confidence: 0.55
+  require_grid_cell: true
+  require_click_point_inside_box: true
+  require_box_inside_screenshot: true
+  min_target_confidence: 0.70
+  max_locator_retries: 2
   click_box_center: true
   enable_template_matching: true
   template_match_threshold: 0.78
   max_targeting_retries: 1
   fallback_to_action_planner: true
+  require_user_confirmation_before_click: false
   # If the next targeting click center is within this distance (capture px) of the last
   # targeting click, skip repeat clicks and use the action planner instead. Set 0 to disable.
   duplicate_click_min_distance_px: 28

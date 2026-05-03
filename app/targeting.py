@@ -1,17 +1,20 @@
-"""Visual targeting: bounding boxes, template matching, validation."""
+"""Visual targeting models and helpers."""
 
 from __future__ import annotations
 
 import logging
+import re
 from pathlib import Path
 
 from PIL import Image, ImageDraw, ImageFont
 
-from pydantic import BaseModel, Field, field_validator, model_validator
+from pydantic import BaseModel, Field, model_validator
 
 from app.utils import project_root
 
 logger = logging.getLogger(__name__)
+
+GRID_CELL_RE = re.compile(r"^[A-Z]+[1-9]\d*$")
 
 
 class TargetBox(BaseModel):
@@ -158,3 +161,96 @@ def locate_template(
         source="template",
         reason=f"matchTemplate({template_path.name})",
     )
+
+
+class LocatedTarget(BaseModel):
+    """Strict located target returned by coordinate-map locator."""
+
+    found: bool
+    target_label: str | None = None
+    grid_cell: str | None = None
+    x1: int | None = None
+    y1: int | None = None
+    x2: int | None = None
+    y2: int | None = None
+    click_x: int | None = None
+    click_y: int | None = None
+    confidence: float = Field(ge=0.0, le=1.0)
+    source: str = "llm_coordinate_map"
+    reason: str | None = None
+
+    @model_validator(mode="after")
+    def validate_target_shape(self) -> "LocatedTarget":
+        if not self.found:
+            return self
+        required = {
+            "target_label": self.target_label,
+            "grid_cell": self.grid_cell,
+            "x1": self.x1,
+            "y1": self.y1,
+            "x2": self.x2,
+            "y2": self.y2,
+            "click_x": self.click_x,
+            "click_y": self.click_y,
+        }
+        missing = [k for k, v in required.items() if v is None]
+        if missing:
+            raise ValueError(f"found=true requires fields: {', '.join(missing)}")
+        assert self.grid_cell is not None
+        if not GRID_CELL_RE.match(self.grid_cell.upper()):
+            raise ValueError(f"Invalid grid_cell: {self.grid_cell}")
+        assert self.x1 is not None and self.y1 is not None
+        assert self.x2 is not None and self.y2 is not None
+        assert self.click_x is not None and self.click_y is not None
+        if self.x2 <= self.x1 or self.y2 <= self.y1:
+            raise ValueError("Target box must satisfy x2>x1 and y2>y1")
+        if not (self.x1 <= self.click_x <= self.x2):
+            raise ValueError("click_x must be inside [x1, x2]")
+        if not (self.y1 <= self.click_y <= self.y2):
+            raise ValueError("click_y must be inside [y1, y2]")
+        return self
+
+
+def validate_target_bounds(target: LocatedTarget, width: int, height: int) -> bool:
+    """Validate box/click are inside screenshot bounds and click is inside box."""
+    if not target.found:
+        return False
+    if width <= 0 or height <= 0:
+        return False
+    assert (
+        target.x1 is not None
+        and target.y1 is not None
+        and target.x2 is not None
+        and target.y2 is not None
+        and target.click_x is not None
+        and target.click_y is not None
+    )
+    if not (0 <= target.x1 <= target.x2 < width and 0 <= target.y1 <= target.y2 < height):
+        return False
+    if not (0 <= target.click_x < width and 0 <= target.click_y < height):
+        return False
+    if not (target.x1 <= target.click_x <= target.x2):
+        return False
+    if not (target.y1 <= target.click_y <= target.y2):
+        return False
+    return True
+
+
+def target_center(target: LocatedTarget) -> tuple[int, int]:
+    """Center of LocatedTarget box."""
+    if target.x1 is None or target.y1 is None or target.x2 is None or target.y2 is None:
+        raise ValueError("target_center requires a complete target box")
+    return (target.x1 + target.x2) // 2, (target.y1 + target.y2) // 2
+
+
+def target_signature(target: LocatedTarget) -> str:
+    """Stable signature used for repeated-target/inconsistency detection."""
+    if not target.found:
+        return "none"
+    if target.click_x is None or target.click_y is None:
+        return "invalid"
+    label = (target.target_label or "unknown").strip().lower()
+    cell = (target.grid_cell or "?").strip().upper()
+    bucket_x = int(target.click_x // 50) * 50
+    bucket_y = int(target.click_y // 50) * 50
+    return f"{label}:{cell}:{bucket_x}:{bucket_y}"
